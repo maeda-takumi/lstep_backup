@@ -24,7 +24,11 @@ from typing import Iterable
 from urllib.parse import urljoin
 
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -293,6 +297,26 @@ def find_first_usable(elements: Iterable[WebElement]) -> WebElement | None:
     return None
 
 
+def click_pager_control(driver: WebDriver, element: WebElement) -> None:
+    """Click a pager control, using JavaScript when fixed panels intercept it.
+
+    LSTEP can keep a profile panel fixed over the lower-right edge of the
+    viewport. Selenium's normal click uses the element's screen coordinates and
+    can therefore be intercepted even when the pager button itself is valid.
+    Centering the control first handles most cases; the JavaScript fallback keeps
+    pagination moving when an overlay still receives the coordinate click.
+    """
+
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+        element,
+    )
+    time.sleep(0.1)
+    try:
+        element.click()
+    except ElementClickInterceptedException:
+        driver.execute_script("arguments[0].click();", element)
+
 def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -> WebElement | None:
     """Find the pager control for the next page.
 
@@ -317,11 +341,6 @@ def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -
         return explicit
 
     next_page_label = str(current_page + 1)
-    numbered_next = driver.find_elements(
-        By.XPATH,
-        f"//nav[@aria-label='Pagination']//a[normalize-space(.)='{next_page_label}']"
-        f" | //nav[@aria-label='Pagination']//button[normalize-space(.)='{next_page_label}']",
-    )
     numbered_next = driver.find_elements(By.XPATH, pagination_xpath_for(next_page_label))
     numbered = find_first_usable(numbered_next)
     if numbered is not None:
@@ -375,7 +394,7 @@ def paginate_and_collect_friends(
         previous_fingerprint = friend_page_fingerprint(
             driver, container_selector, link_selector
         )
-        next_button.click()
+        click_pager_control(driver, next_button)
         time.sleep(wait_seconds)
         try:
             WebDriverWait(driver, max(3, int(wait_seconds * 4))).until(

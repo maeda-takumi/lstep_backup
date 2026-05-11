@@ -16,6 +16,8 @@ def install_selenium_stubs():
     remote_webelement = types.ModuleType("selenium.webdriver.remote.webelement")
     support_ui = types.ModuleType("selenium.webdriver.support.ui")
 
+    class ElementClickInterceptedException(Exception):
+        pass
     class StaleElementReferenceException(Exception):
         pass
 
@@ -40,6 +42,7 @@ def install_selenium_stubs():
         def __init__(self, *_args, **_kwargs):
             pass
 
+    exceptions.ElementClickInterceptedException = ElementClickInterceptedException
     exceptions.StaleElementReferenceException = StaleElementReferenceException
     exceptions.TimeoutException = TimeoutException
     options_mod.Options = Options
@@ -65,9 +68,11 @@ def install_selenium_stubs():
 
 
 try:
+    from selenium.common.exceptions import ElementClickInterceptedException
     from selenium.webdriver.common.by import By
 except ModuleNotFoundError:
     install_selenium_stubs()
+    from selenium.common.exceptions import ElementClickInterceptedException
     from selenium.webdriver.common.by import By
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -75,11 +80,25 @@ import scrape_lstep
 
 
 class FakeElement:
-    def __init__(self, href="#", classes="", displayed=True, enabled=True):
+    def __init__(
+        self,
+        href="#",
+        classes="",
+        displayed=True,
+        enabled=True,
+        intercept_click=False,
+    ):
         self.href = href
         self.classes = classes
         self.displayed = displayed
         self.enabled = enabled
+        self.intercept_click = intercept_click
+        self.clicked = False
+
+    def click(self):
+        if self.intercept_click:
+            raise ElementClickInterceptedException("intercepted")
+        self.clicked = True
 
     def is_displayed(self):
         return self.displayed
@@ -100,7 +119,13 @@ class FakeElement:
 class FakeDriver:
     def __init__(self):
         self.calls = []
+        self.script_calls = []
         self.pager_next = FakeElement(href="https://manager.linestep.net/line/show?page=2")
+
+    def execute_script(self, script, *args):
+        self.script_calls.append((script, args))
+        if script == "arguments[0].click();":
+            args[0].clicked = True
 
     def find_elements(self, by, selector):
         self.calls.append((by, selector))
@@ -124,6 +149,20 @@ class PagerDetectionTest(unittest.TestCase):
         self.assertTrue(xpath_calls)
         self.assertFalse(any(selector.startswith("//a[") for selector in xpath_calls))
 
+    def test_click_pager_control_uses_javascript_fallback_when_intercepted(self):
+        driver = FakeDriver()
+        element = FakeElement(intercept_click=True)
+
+        scrape_lstep.click_pager_control(driver, element)
+
+        self.assertTrue(element.clicked)
+        self.assertEqual(
+            [call[0] for call in driver.script_calls],
+            [
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                "arguments[0].click();",
+            ],
+        )
     def test_friend_list_url_guard_defaults_to_line_show(self):
         self.assertTrue(
             scrape_lstep.is_friend_list_url(
