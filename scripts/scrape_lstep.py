@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""LSTEP friend-list and chat-history scraper.
+"""LSTEP friend-list href scraper.
 
 This script opens LSTEP with Chrome/Selenium, lets the operator log in manually,
-then saves friend links and chat messages into a local SQLite database.
+then saves friend hrefs from every paginated friend-list page into a local
+SQLite database. It does not open each friend detail page while collecting hrefs.
 
 The LSTEP DOM can change, so most CSS selectors are configurable by CLI options.
-Start with the defaults, and narrow selectors if unrelated links/messages are
-captured on your account screen.
+Start with the defaults, and narrow selectors if unrelated links are captured
+on your account screen.
 """
 
 from __future__ import annotations
@@ -37,9 +38,6 @@ DEFAULT_NEXT_SELECTOR = (
     "a[rel='next'], button[rel='next'], .pagination a[aria-label*='次'], "
     ".pagination button[aria-label*='次'], a[aria-label='Next'], button[aria-label='Next']"
 )
-DEFAULT_CHAT_MESSAGE_SELECTOR = (
-    "[class*='message'], [class*='Message'], [class*='chat'], [class*='Chat']"
-)
 DISABLED_CLASSES = ("disabled", "is-disabled", "is_disabled", "pager-disabled")
 
 
@@ -50,14 +48,6 @@ class Friend:
     name: str
     href: str
 
-
-@dataclass(frozen=True)
-class ChatMessage:
-    """Chat message row scraped from a friend detail/chat page."""
-
-    text: str
-    sender: str | None = None
-    sent_at: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -94,20 +84,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             href TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            message_text TEXT NOT NULL,
-            sender TEXT,
-            sent_at TEXT,
-            created_at TEXT NOT NULL,
-            UNIQUE(user_id, message_text, sender, sent_at),
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )
         """
     )
@@ -328,7 +304,7 @@ def paginate_and_collect_friends(
     return total_seen
 
 def wait_for_friend_list(driver: WebDriver, link_selector: str, timeout_seconds: int) -> None:
-    """Wait until the operator reaches a page containing friend detail links."""
+    """Wait until the operator reaches a page containing friend hrefs."""
 
     print(
         "LSTEPにログインし、友だちリスト画面を開いてください。"
@@ -338,75 +314,6 @@ def wait_for_friend_list(driver: WebDriver, link_selector: str, timeout_seconds:
         lambda d: len(d.find_elements(By.CSS_SELECTOR, link_selector)) > 0
     )
 
-
-def get_users(conn: sqlite3.Connection) -> list[tuple[int, str, str]]:
-    """Return saved users as (id, name, href)."""
-
-    return list(conn.execute("SELECT id, name, href FROM users ORDER BY id"))
-
-
-def extract_chat_messages(driver: WebDriver, message_selector: str) -> list[ChatMessage]:
-    """Extract chat messages from the current user detail/chat page."""
-
-    messages: list[ChatMessage] = []
-    seen: set[str] = set()
-    for node in driver.find_elements(By.CSS_SELECTOR, message_selector):
-        text = safe_text(node)
-        if not text or text in seen:
-            continue
-        sender = node.get_attribute("data-sender") or None
-        sent_at = node.get_attribute("datetime") or node.get_attribute("data-time") or None
-        messages.append(ChatMessage(text=text, sender=sender, sent_at=sent_at))
-        seen.add(text)
-    return messages
-
-
-def insert_chat_messages(
-    conn: sqlite3.Connection,
-    user_id: int,
-    messages: Iterable[ChatMessage],
-) -> int:
-    """Insert chat messages for one user and return inserted/ignored count."""
-
-    now = utc_now_iso()
-    count = 0
-    for message in messages:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO chat_messages
-                (user_id, message_text, sender, sent_at, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user_id, message.text, message.sender, message.sent_at, now),
-        )
-        count += 1
-    conn.commit()
-    return count
-
-
-def collect_chat_histories(
-    driver: WebDriver,
-    conn: sqlite3.Connection,
-    message_selector: str,
-    wait_seconds: float,
-    max_users: int | None,
-) -> int:
-    """Open each saved friend URL and persist visible chat messages."""
-
-    total = 0
-    users = get_users(conn)
-    if max_users is not None:
-        users = users[:max_users]
-
-    for index, (user_id, name, href) in enumerate(users, start=1):
-        print(f"[chat] ({index}/{len(users)}) open user_id={user_id} name={name} href={href}")
-        driver.get(href)
-        time.sleep(wait_seconds)
-        messages = extract_chat_messages(driver, message_selector)
-        saved = insert_chat_messages(conn, user_id, messages)
-        total += saved
-        print(f"[chat] user_id={user_id} saved_or_ignored={saved}")
-    return total
 
 
 def parse_keywords(raw_keywords: str) -> tuple[str, ...]:
@@ -419,7 +326,7 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI options."""
 
     parser = argparse.ArgumentParser(
-        description="Scrape LSTEP friend links and visible chat histories into SQLite."
+        description="Scrape LSTEP friend hrefs from all paginated friend-list pages into SQLite."
     )
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite DB file path.")
     parser.add_argument("--login-url", default=LOGIN_URL, help="LSTEP login URL.")
@@ -438,11 +345,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_NEXT_SELECTOR,
         help="CSS selector for the next-page control.",
     )
-    parser.add_argument(
-        "--chat-message-selector",
-        default=DEFAULT_CHAT_MESSAGE_SELECTOR,
-        help="CSS selector for chat message containers on a user detail/chat page.",
-    )
     parser.add_argument("--wait-seconds", type=float, default=1.5, help="Wait after page changes.")
     parser.add_argument(
         "--friend-list-timeout",
@@ -451,8 +353,6 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for the friend-list page after opening the login URL.",
     )
     parser.add_argument("--max-pages", type=int, default=None, help="Limit friend-list pages for testing.")
-    parser.add_argument("--max-users", type=int, default=None, help="Limit chat-history users for testing.")
-    parser.add_argument("--skip-chat", action="store_true", help="Collect only users, not chat histories.")
     parser.add_argument("--headless", action="store_true", help="Run Chrome headless after login if possible.")
     parser.add_argument(
         "--user-data-dir",
@@ -499,18 +399,7 @@ def main() -> int:
             )
             print(f"[friends] total saved_or_updated rows: {total_friends}")
 
-            if not args.skip_chat:
-                input(
-                    "チャット履歴の取得を開始します。必要に応じて画面状態を整えてEnterを押してください..."
-                )
-                total_messages = collect_chat_histories(
-                    driver=driver,
-                    conn=conn,
-                    message_selector=args.chat_message_selector,
-                    wait_seconds=args.wait_seconds,
-                    max_users=args.max_users,
-                )
-                print(f"[chat] total saved_or_ignored rows: {total_messages}")
+            print("[friends] detail pages were not opened; href collection is complete.")
         finally:
             driver.quit()
     print(f"Done. DB: {db_path.resolve()}")
