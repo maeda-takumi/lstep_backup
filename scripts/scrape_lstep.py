@@ -35,6 +35,7 @@ LOGIN_URL = "https://manager.linestep.net/account/login"
 DEFAULT_DB_PATH = "lstep_chat_history.db"
 DEFAULT_FRIEND_CONTAINER_SELECTOR = "table.tw-w-full.tw-table-fixed"
 DEFAULT_FRIEND_LINK_SELECTOR = "a[href]"
+DEFAULT_FRIEND_LIST_URL_KEYWORD = "/line/show"
 DEFAULT_NEXT_SELECTOR = (
     "nav[aria-label='Pagination'] a, nav[aria-label='Pagination'] button, "
     "a[rel='next'], button[rel='next'], .pagination a[aria-label*='次'], "
@@ -211,6 +212,54 @@ def upsert_friends(conn: sqlite3.Connection, friends: Iterable[Friend]) -> int:
     conn.commit()
     return count
 
+def is_friend_list_url(url: str, friend_list_url_keyword: str) -> bool:
+    """Return True when the current URL is the friend-list page."""
+
+    return not friend_list_url_keyword or friend_list_url_keyword in url
+
+
+def pager_scope_xpath() -> str:
+    """Return the XPath union for supported pager containers."""
+
+    return (
+        "//nav[@aria-label='Pagination']"
+        " | //*[contains(concat(' ', normalize-space(@class), ' '), ' pagination ')]"
+    )
+
+
+def pagination_xpath_for(label: str) -> str:
+    """Build an exact-label XPath scoped to pager containers."""
+
+    quoted_label = xpath_literal(label)
+    pager_scope = pager_scope_xpath()
+    return (
+        f"({pager_scope})//a[normalize-space(.)={quoted_label}]"
+        f" | ({pager_scope})//button[normalize-space(.)={quoted_label}]"
+    )
+
+
+def pagination_contains_xpath_for(label: str) -> str:
+    """Build a partial-label XPath scoped to pager containers."""
+
+    quoted_label = xpath_literal(label)
+    pager_scope = pager_scope_xpath()
+    condition = (
+        f"contains(@aria-label, {quoted_label}) "
+        f"or contains(normalize-space(.), {quoted_label})"
+    )
+    return f"({pager_scope})//a[{condition}] | ({pager_scope})//button[{condition}]"
+
+
+def xpath_literal(value: str) -> str:
+    """Quote a Python string for safe use as an XPath string literal."""
+
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
 
 def element_is_disabled(element: WebElement) -> bool:
     """Detect disabled pager controls."""
@@ -248,18 +297,20 @@ def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -
     """Find the pager control for the next page.
 
     LSTEP's current pager may render page numbers as ``nav[aria-label=Pagination]``
-    buttons rather than a dedicated ``rel=next`` link. Prefer explicit next controls,
-    then click the button/link whose visible number is ``current_page + 1``.
+    buttons rather than a dedicated ``rel=next`` link. To avoid opening a friend
+    detail link whose text happens to contain "次"/"Next", default detection only
+    searches inside pager containers.
     """
 
     explicit_next = driver.find_elements(
         By.XPATH,
-        "//a[(contains(@aria-label, '次') or contains(@aria-label, 'Next') "
-        "or contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')) "
-        "and not(contains(@aria-label, '前')) and not(contains(normalize-space(.), '前'))]"
-        " | //button[(contains(@aria-label, '次') or contains(@aria-label, 'Next') "
-        "or contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')) "
-        "and not(contains(@aria-label, '前')) and not(contains(normalize-space(.), '前'))]",
+        pagination_contains_xpath_for("次")
+        + " | "
+        + pagination_contains_xpath_for("Next")
+        + " | "
+        + pagination_xpath_for("›")
+        + " | "
+        + pagination_xpath_for("»"),
     )
     explicit = find_first_usable(explicit_next)
     if explicit is not None:
@@ -271,6 +322,7 @@ def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -
         f"//nav[@aria-label='Pagination']//a[normalize-space(.)='{next_page_label}']"
         f" | //nav[@aria-label='Pagination']//button[normalize-space(.)='{next_page_label}']",
     )
+    numbered_next = driver.find_elements(By.XPATH, pagination_xpath_for(next_page_label))
     numbered = find_first_usable(numbered_next)
     if numbered is not None:
         return numbered
@@ -289,12 +341,20 @@ def paginate_and_collect_friends(
     include_keywords: tuple[str, ...],
     wait_seconds: float,
     max_pages: int | None,
+    friend_list_url_keyword: str,
 ) -> int:
     """Scrape friend links on each paginated friend-list page."""
 
     total_seen = 0
     page = 1
     while True:
+        if not is_friend_list_url(driver.current_url, friend_list_url_keyword):
+            print(
+                "[friends] current page is not the friend-list URL; "
+                f"pager search was skipped. url={driver.current_url}"
+            )
+            break
+
         friends = scrape_friends_on_current_page(
             driver, container_selector, link_selector, include_keywords
         )
@@ -319,14 +379,26 @@ def paginate_and_collect_friends(
         time.sleep(wait_seconds)
         try:
             WebDriverWait(driver, max(3, int(wait_seconds * 4))).until(
-                lambda d: d.current_url != previous_url
-                or friend_page_fingerprint(
-                    d, container_selector, link_selector
+                lambda d: is_friend_list_url(d.current_url, friend_list_url_keyword)
+                and (
+                    d.current_url != previous_url
+                    or friend_page_fingerprint(
+                        d, container_selector, link_selector
+                    )
+                    != previous_fingerprint
                 )
-                != previous_fingerprint
             )
         except TimeoutException:
-            print("[friends] page transition wait timed out; stopping to avoid duplicate collection.")
+            if not is_friend_list_url(driver.current_url, friend_list_url_keyword):
+                print(
+                    "[friends] clicked control left the friend-list page; stopping "
+                    f"without collecting detail page. url={driver.current_url}"
+                )
+            else:
+                print(
+                    "[friends] page transition wait timed out; "
+                    "stopping to avoid duplicate collection."
+                )
             break
         page += 1
     return total_seen
@@ -336,6 +408,7 @@ def wait_for_friend_list(
     container_selector: str,
     link_selector: str,
     timeout_seconds: int,
+    friend_list_url_keyword: str,
 ) -> None:
     """Wait until the operator reaches a page containing friend hrefs."""
 
@@ -344,7 +417,8 @@ def wait_for_friend_list(
         "リンクを検出したら自動で取得を開始します。"
     )
     WebDriverWait(driver, timeout_seconds).until(
-        lambda d: len(find_friend_links(d, container_selector, link_selector)) > 0
+        lambda d: is_friend_list_url(d.current_url, friend_list_url_keyword)
+        and len(find_friend_links(d, container_selector, link_selector)) > 0
     )
 
 
@@ -389,6 +463,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_NEXT_SELECTOR,
         help="CSS selector for the next-page control.",
     )
+    parser.add_argument(
+        "--friend-list-url-keyword",
+        default=DEFAULT_FRIEND_LIST_URL_KEYWORD,
+        help=(
+            "Substring that identifies the friend-list URL before scraping/paging. "
+            "Use an empty string to disable this guard."
+        ),
+    )
     parser.add_argument("--wait-seconds", type=float, default=1.5, help="Wait after page changes.")
     parser.add_argument(
         "--friend-list-timeout",
@@ -432,6 +514,7 @@ def main() -> int:
                     container_selector=args.friend_container_selector,
                     link_selector=args.friend_link_selector,
                     timeout_seconds=args.friend_list_timeout,
+                    friend_list_url_keyword=args.friend_list_url_keyword,
                 )
             total_friends = paginate_and_collect_friends(
                 driver=driver,
@@ -442,6 +525,7 @@ def main() -> int:
                 include_keywords=include_keywords,
                 wait_seconds=args.wait_seconds,
                 max_pages=args.max_pages,
+                friend_list_url_keyword=args.friend_list_url_keyword,
             )
             print(f"[friends] total saved_or_updated rows: {total_friends}")
 
