@@ -31,8 +31,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 LOGIN_URL = "https://manager.linestep.net/account/login"
 DEFAULT_DB_PATH = "lstep_chat_history.db"
-DEFAULT_FRIEND_LINK_SELECTOR = "a[href]"
+DEFAULT_FRIEND_LINK_SELECTOR = "a[href*='/line/detail/']"
 DEFAULT_NEXT_SELECTOR = (
+    "nav[aria-label='Pagination'] a, nav[aria-label='Pagination'] button, "
     "a[rel='next'], button[rel='next'], .pagination a[aria-label*='次'], "
     ".pagination button[aria-label*='次'], a[aria-label='Next'], button[aria-label='Next']"
 )
@@ -128,6 +129,27 @@ def safe_text(element: WebElement) -> str:
     except StaleElementReferenceException:
         return ""
 
+def closest_text(driver: WebDriver, element: WebElement, selector: str) -> str:
+    """Read visible text from the closest ancestor matching selector."""
+
+    try:
+        ancestor = driver.execute_script("return arguments[0].closest(arguments[1]);", element, selector)
+    except StaleElementReferenceException:
+        return ""
+    if not ancestor:
+        return ""
+    return safe_text(ancestor)
+
+
+def friend_page_fingerprint(driver: WebDriver, link_selector: str) -> tuple[str, ...]:
+    """Return the ordered friend hrefs currently visible on the page."""
+
+    hrefs: list[str] = []
+    for link in driver.find_elements(By.CSS_SELECTOR, link_selector):
+        href = link.get_attribute("href") or ""
+        if href:
+            hrefs.append(absolute_href(driver, href.strip()))
+    return tuple(hrefs)
 
 def absolute_href(driver: WebDriver, href: str) -> str:
     """Convert a possibly relative href into an absolute URL."""
@@ -163,7 +185,11 @@ def scrape_friends_on_current_page(
 
         name = safe_text(link)
         if not name:
-            name = link.get_attribute("title") or link.get_attribute("aria-label") or href
+            name = link.get_attribute("title") or link.get_attribute("aria-label") or ""
+        if not name:
+            name = closest_text(driver, link, "tr")
+        if not name:
+            name = href
         friends.append(Friend(name=normalize_space(name), href=href))
         seen_hrefs.add(href)
     return friends
@@ -205,23 +231,56 @@ def element_is_disabled(element: WebElement) -> bool:
     )
 
 
-def find_next_button(driver: WebDriver, next_selector: str) -> WebElement | None:
-    """Find an enabled next-page control using CSS selector and text fallback."""
+def usable_pager_control(element: WebElement) -> bool:
+    """Return True when a pager control can be clicked."""
+    try:
+        return element.is_displayed() and element.is_enabled() and not element_is_disabled(element)
+    except StaleElementReferenceException:
+        return False
 
-    candidates = driver.find_elements(By.CSS_SELECTOR, next_selector)
-    candidates.extend(
-        driver.find_elements(
-            By.XPATH,
-            "//a[contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')]"
-            " | //button[contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')]",
-        )
+
+def find_first_usable(elements: Iterable[WebElement]) -> WebElement | None:
+    """Return the first displayed, enabled, non-disabled element."""
+
+    for element in elements:
+        if usable_pager_control(element):
+            return element
+    return None
+
+
+def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -> WebElement | None:
+    """Find the pager control for the next page.
+
+    LSTEP's current pager may render page numbers as ``nav[aria-label=Pagination]``
+    buttons rather than a dedicated ``rel=next`` link. Prefer explicit next controls,
+    then click the button/link whose visible number is ``current_page + 1``.
+    """
+
+    explicit_next = driver.find_elements(
+        By.XPATH,
+        "//a[(contains(@aria-label, '次') or contains(@aria-label, 'Next') "
+        "or contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')) "
+        "and not(contains(@aria-label, '前')) and not(contains(normalize-space(.), '前'))]"
+        " | //button[(contains(@aria-label, '次') or contains(@aria-label, 'Next') "
+        "or contains(normalize-space(.), '次') or contains(normalize-space(.), 'Next')) "
+        "and not(contains(@aria-label, '前')) and not(contains(normalize-space(.), '前'))]",
     )
-    for candidate in candidates:
-        try:
-            if candidate.is_displayed() and candidate.is_enabled() and not element_is_disabled(candidate):
-                return candidate
-        except StaleElementReferenceException:
-            continue
+    explicit = find_first_usable(explicit_next)
+    if explicit is not None:
+        return explicit
+
+    next_page_label = str(current_page + 1)
+    numbered_next = driver.find_elements(
+        By.XPATH,
+        f"//nav[@aria-label='Pagination']//a[normalize-space(.)='{next_page_label}']"
+        f" | //nav[@aria-label='Pagination']//button[normalize-space(.)='{next_page_label}']",
+    )
+    numbered = find_first_usable(numbered_next)
+    if numbered is not None:
+        return numbered
+
+    if next_selector != DEFAULT_NEXT_SELECTOR:
+        return find_first_usable(driver.find_elements(By.CSS_SELECTOR, next_selector))
     return None
 
 
@@ -248,22 +307,36 @@ def paginate_and_collect_friends(
             print(f"[friends] max pages reached: {max_pages}")
             break
 
-        next_button = find_next_button(driver, next_selector)
+        next_button = find_next_button(driver, next_selector, page)
         if next_button is None:
             print("[friends] next page button was not found; finished friend-list collection.")
             break
 
         previous_url = driver.current_url
+        previous_fingerprint = friend_page_fingerprint(driver, link_selector)
         next_button.click()
         time.sleep(wait_seconds)
         try:
             WebDriverWait(driver, max(3, int(wait_seconds * 4))).until(
-                lambda d: d.current_url != previous_url or scrape_friends_on_current_page(d, link_selector, include_keywords)
+                lambda d: d.current_url != previous_url
+                or friend_page_fingerprint(d, link_selector) != previous_fingerprint
             )
         except TimeoutException:
-            print("[friends] page transition wait timed out; continuing with current page.")
+            print("[friends] page transition wait timed out; stopping to avoid duplicate collection.")
+            break
         page += 1
     return total_seen
+
+def wait_for_friend_list(driver: WebDriver, link_selector: str, timeout_seconds: int) -> None:
+    """Wait until the operator reaches a page containing friend detail links."""
+
+    print(
+        "LSTEPにログインし、友だちリスト画面を開いてください。"
+        "リンクを検出したら自動で取得を開始します。"
+    )
+    WebDriverWait(driver, timeout_seconds).until(
+        lambda d: len(d.find_elements(By.CSS_SELECTOR, link_selector)) > 0
+    )
 
 
 def get_users(conn: sqlite3.Connection) -> list[tuple[int, str, str]]:
@@ -357,7 +430,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--friend-href-keywords",
-        default="friend,chat,talk,user,customer",
+        default="/line/detail/",
         help="Comma-separated keywords that must appear in friend hrefs. Empty means all links.",
     )
     parser.add_argument(
@@ -371,6 +444,12 @@ def parse_args() -> argparse.Namespace:
         help="CSS selector for chat message containers on a user detail/chat page.",
     )
     parser.add_argument("--wait-seconds", type=float, default=1.5, help="Wait after page changes.")
+    parser.add_argument(
+        "--friend-list-timeout",
+        type=int,
+        default=900,
+        help="Seconds to wait for the friend-list page after opening the login URL.",
+    )
     parser.add_argument("--max-pages", type=int, default=None, help="Limit friend-list pages for testing.")
     parser.add_argument("--max-users", type=int, default=None, help="Limit chat-history users for testing.")
     parser.add_argument("--skip-chat", action="store_true", help="Collect only users, not chat histories.")
@@ -379,6 +458,11 @@ def parse_args() -> argparse.Namespace:
         "--user-data-dir",
         default=None,
         help="Chrome user-data-dir path for keeping a persistent login session.",
+    )
+    parser.add_argument(
+        "--confirm-before-friends",
+        action="store_true",
+        help="Require Enter before collecting friend links (disabled by default).",
     )
     return parser.parse_args()
 
@@ -394,9 +478,16 @@ def main() -> int:
         driver = create_driver(headless=args.headless, user_data_dir=args.user_data_dir)
         try:
             driver.get(args.login_url)
-            input(
-                "LSTEPにログインし、友だちリスト画面を開いたらEnterを押してください..."
-            )
+            if args.confirm_before_friends:
+                input(
+                    "LSTEPにログインし、友だちリスト画面を開いたらEnterを押してください..."
+                )
+            else:
+                wait_for_friend_list(
+                    driver=driver,
+                    link_selector=args.friend_link_selector,
+                    timeout_seconds=args.friend_list_timeout,
+                )
             total_friends = paginate_and_collect_friends(
                 driver=driver,
                 conn=conn,

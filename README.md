@@ -20,8 +20,9 @@ python scripts/scrape_lstep.py
 
 1. Chrome で `https://manager.linestep.net/account/login` が開きます。
 2. 手動でログインし、友だちリスト画面まで移動します。
-3. ターミナルで Enter を押すと、全ページの友だちリンクを SQLite に保存します。
-4. 続けて Enter を押すと、保存済み友だち URL を順番に開いて、表示されるチャット履歴を保存します。
+3. 友だちリストの `/line/detail/` リンクを検出すると、Enter などの確認なしで全ページの友だち href を SQLite に保存します。
+4. ページャー（`nav[aria-label="Pagination"]` のページ番号ボタン、または「次」ボタン）で次ページへ進み、全ページを自動取得します。
+5. 続けて Enter を押すと、保存済み友だち URL を順番に開いて、表示されるチャット履歴を保存します。
 
 既定の DB ファイルは `lstep_chat_history.db` です。
 
@@ -54,9 +55,9 @@ LSTEP の画面構造はアカウントや更新で変わる可能性があり�
 
 ```bash
 python scripts/scrape_lstep.py \
-  --friend-link-selector "a[href*='/friends/']" \
-  --friend-href-keywords "friends" \
-  --next-selector ".pagination .next:not(.disabled)" \
+  --friend-link-selector "a[href*='/line/detail/']" \
+  --friend-href-keywords "/line/detail/" \
+  --next-selector "nav[aria-label='Pagination'] button" \
   --chat-message-selector ".message-row"
 ```
 
@@ -66,6 +67,7 @@ python scripts/scrape_lstep.py \
 python scripts/scrape_lstep.py --skip-chat --max-pages 1
 ```
 
+友だち一覧取得前に従来どおり Enter 確認を入れたい場合は `--confirm-before-friends` を指定してください。
 ## 注意
 
 - ログイン情報はコードや DB に保存しません。
