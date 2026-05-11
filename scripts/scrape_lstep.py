@@ -2,8 +2,9 @@
 """LSTEP friend-list href scraper.
 
 This script opens LSTEP with Chrome/Selenium, lets the operator log in manually,
-then saves friend hrefs from every paginated friend-list page into a local
-SQLite database. It does not open each friend detail page while collecting hrefs.
+then saves hrefs from A tags inside the configured friend-list element on
+every paginated page into a local SQLite database. It reads href attributes only
+and does not open each href while collecting links.
 
 The LSTEP DOM can change, so most CSS selectors are configurable by CLI options.
 Start with the defaults, and narrow selectors if unrelated links are captured
@@ -32,7 +33,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 LOGIN_URL = "https://manager.linestep.net/account/login"
 DEFAULT_DB_PATH = "lstep_chat_history.db"
-DEFAULT_FRIEND_LINK_SELECTOR = "a[href*='/line/detail/']"
+DEFAULT_FRIEND_CONTAINER_SELECTOR = "table.tw-w-full.tw-table-fixed"
+DEFAULT_FRIEND_LINK_SELECTOR = "a[href]"
 DEFAULT_NEXT_SELECTOR = (
     "nav[aria-label='Pagination'] a, nav[aria-label='Pagination'] button, "
     "a[rel='next'], button[rel='next'], .pagination a[aria-label*='次'], "
@@ -117,11 +119,28 @@ def closest_text(driver: WebDriver, element: WebElement, selector: str) -> str:
     return safe_text(ancestor)
 
 
-def friend_page_fingerprint(driver: WebDriver, link_selector: str) -> tuple[str, ...]:
+def find_friend_links(
+    driver: WebDriver,
+    container_selector: str,
+    link_selector: str,
+) -> list[WebElement]:
+    """Find links inside the configured friend-list container."""
+
+    scoped_selector = (
+        f"{container_selector} {link_selector}" if container_selector else link_selector
+    )
+    return driver.find_elements(By.CSS_SELECTOR, scoped_selector)
+
+
+def friend_page_fingerprint(
+    driver: WebDriver,
+    container_selector: str,
+    link_selector: str,
+) -> tuple[str, ...]:
     """Return the ordered friend hrefs currently visible on the page."""
 
     hrefs: list[str] = []
-    for link in driver.find_elements(By.CSS_SELECTOR, link_selector):
+    for link in find_friend_links(driver, container_selector, link_selector):
         href = link.get_attribute("href") or ""
         if href:
             hrefs.append(absolute_href(driver, href.strip()))
@@ -146,6 +165,7 @@ def looks_like_friend_href(href: str, include_keywords: tuple[str, ...]) -> bool
 
 def scrape_friends_on_current_page(
     driver: WebDriver,
+    container_selector: str,
     link_selector: str,
     include_keywords: tuple[str, ...],
 ) -> list[Friend]:
@@ -153,7 +173,7 @@ def scrape_friends_on_current_page(
 
     friends: list[Friend] = []
     seen_hrefs: set[str] = set()
-    for link in driver.find_elements(By.CSS_SELECTOR, link_selector):
+    for link in find_friend_links(driver, container_selector, link_selector):
         href = link.get_attribute("href") or ""
         href = absolute_href(driver, href.strip()) if href else ""
         if not href or href in seen_hrefs or not looks_like_friend_href(href, include_keywords):
@@ -263,6 +283,7 @@ def find_next_button(driver: WebDriver, next_selector: str, current_page: int) -
 def paginate_and_collect_friends(
     driver: WebDriver,
     conn: sqlite3.Connection,
+    container_selector: str,
     link_selector: str,
     next_selector: str,
     include_keywords: tuple[str, ...],
@@ -274,7 +295,9 @@ def paginate_and_collect_friends(
     total_seen = 0
     page = 1
     while True:
-        friends = scrape_friends_on_current_page(driver, link_selector, include_keywords)
+        friends = scrape_friends_on_current_page(
+            driver, container_selector, link_selector, include_keywords
+        )
         saved = upsert_friends(conn, friends)
         total_seen += saved
         print(f"[friends] page={page} saved_or_updated={saved} url={driver.current_url}")
@@ -289,13 +312,18 @@ def paginate_and_collect_friends(
             break
 
         previous_url = driver.current_url
-        previous_fingerprint = friend_page_fingerprint(driver, link_selector)
+        previous_fingerprint = friend_page_fingerprint(
+            driver, container_selector, link_selector
+        )
         next_button.click()
         time.sleep(wait_seconds)
         try:
             WebDriverWait(driver, max(3, int(wait_seconds * 4))).until(
                 lambda d: d.current_url != previous_url
-                or friend_page_fingerprint(d, link_selector) != previous_fingerprint
+                or friend_page_fingerprint(
+                    d, container_selector, link_selector
+                )
+                != previous_fingerprint
             )
         except TimeoutException:
             print("[friends] page transition wait timed out; stopping to avoid duplicate collection.")
@@ -303,7 +331,12 @@ def paginate_and_collect_friends(
         page += 1
     return total_seen
 
-def wait_for_friend_list(driver: WebDriver, link_selector: str, timeout_seconds: int) -> None:
+def wait_for_friend_list(
+    driver: WebDriver,
+    container_selector: str,
+    link_selector: str,
+    timeout_seconds: int,
+) -> None:
     """Wait until the operator reaches a page containing friend hrefs."""
 
     print(
@@ -311,7 +344,7 @@ def wait_for_friend_list(driver: WebDriver, link_selector: str, timeout_seconds:
         "リンクを検出したら自動で取得を開始します。"
     )
     WebDriverWait(driver, timeout_seconds).until(
-        lambda d: len(d.find_elements(By.CSS_SELECTOR, link_selector)) > 0
+        lambda d: len(find_friend_links(d, container_selector, link_selector)) > 0
     )
 
 
@@ -326,19 +359,30 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI options."""
 
     parser = argparse.ArgumentParser(
-        description="Scrape LSTEP friend hrefs from all paginated friend-list pages into SQLite."
+        description=(
+            "Scrape hrefs from A tags inside the LSTEP friend-list element "
+            "on all paginated pages into SQLite."
+        )
     )
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite DB file path.")
     parser.add_argument("--login-url", default=LOGIN_URL, help="LSTEP login URL.")
     parser.add_argument(
+        "--friend-container-selector",
+        default=DEFAULT_FRIEND_CONTAINER_SELECTOR,
+        help=(
+            "CSS selector for the element containing friend links. "
+            "Use an empty string to search the whole page."
+        ),
+    )
+    parser.add_argument(
         "--friend-link-selector",
         default=DEFAULT_FRIEND_LINK_SELECTOR,
-        help="CSS selector for friend links on the friend-list page.",
+        help="CSS selector for href links inside the friend-list container.",
     )
     parser.add_argument(
         "--friend-href-keywords",
-        default="/line/detail/",
-        help="Comma-separated keywords that must appear in friend hrefs. Empty means all links.",
+        default="",
+        help="Comma-separated keywords that must appear in friend hrefs. Empty means all hrefs.",
     )
     parser.add_argument(
         "--next-selector",
@@ -385,12 +429,14 @@ def main() -> int:
             else:
                 wait_for_friend_list(
                     driver=driver,
+                    container_selector=args.friend_container_selector,
                     link_selector=args.friend_link_selector,
                     timeout_seconds=args.friend_list_timeout,
                 )
             total_friends = paginate_and_collect_friends(
                 driver=driver,
                 conn=conn,
+                container_selector=args.friend_container_selector,
                 link_selector=args.friend_link_selector,
                 next_selector=args.next_selector,
                 include_keywords=include_keywords,
